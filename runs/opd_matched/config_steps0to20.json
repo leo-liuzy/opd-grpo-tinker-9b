@@ -1,0 +1,46 @@
+{
+  "learning_rate": 0.0001,
+  "dataset_configs": [
+    {
+      "dataset_builder": {
+        "batch_size": 64,
+        "model_name_for_tokenizer": "Qwen/Qwen3.5-9B-Base",
+        "renderer_name": "qwen3_5",
+        "group_size": 4,
+        "seed": 0
+      },
+      "teacher_config": {
+        "base_model": "Qwen/Qwen3.5-9B",
+        "load_checkpoint_path": null
+      },
+      "groups_per_batch": 64
+    }
+  ],
+  "model_name": "Qwen/Qwen3.5-9B-Base",
+  "recipe_name": "recipe_distillation_opd_vs_grpo",
+  "renderer_name": "qwen3_5",
+  "max_tokens": 16384,
+  "temperature": 1.0,
+  "compute_post_kl": false,
+  "evaluator_builders": [
+    {}
+  ],
+  "lora_rank": 32,
+  "kl_penalty_coef": 1.0,
+  "kl_discount_factor": 0.0,
+  "loss_fn": "importance_sampling",
+  "loss_fn_config": null,
+  "num_substeps": 1,
+  "wandb_project": "opd_vs_grpo",
+  "wandb_name": "opd_matched-deepmath-Qwen-Qwen3.5-9B-Base-0.0001lr-64x4-16384tok-seed0-2026-08-14-16-19",
+  "log_path": "runs/opd_matched",
+  "base_url": null,
+  "enable_trace": false,
+  "span_chart_every": 0,
+  "eval_every": 5,
+  "save_every": 10,
+  "load_checkpoint_path": "tinker://b89f6676-49c4-53ed-9788-2e0c81a9eabf:train:0/weights/final",
+  "num_groups_to_log": 64,
+  "rollout_json_export": true,
+  "max_steps": 21
+}

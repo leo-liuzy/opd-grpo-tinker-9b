@@ -1,0 +1,1543 @@
+diff --git a/tinker_cookbook/distillation/datasets.py b/tinker_cookbook/distillation/datasets.py
+index e0591c0..f0f0f7e 100644
+--- a/tinker_cookbook/distillation/datasets.py
++++ b/tinker_cookbook/distillation/datasets.py
+@@ -27,6 +27,8 @@ from tinker_cookbook.rl.types import (
+     StepResult,
+ )
+ from tinker_cookbook.tokenizer_utils import get_tokenizer
++from tinker_cookbook.utils import logtree
++from tinker_cookbook.utils.logtree_formatters import ConversationFormatter
+ 
+ 
+ @chz.chz
+@@ -111,7 +113,33 @@ class PromptOnlyEnv(ProblemEnv):
+         return ""
+ 
+     async def step(self, action: Action, *, extra: ActionExtra | None = None) -> StepResult:
+-        """Return zero reward always."""
++        """Return zero reward always, recording the exchange for inspection.
++
++        Deliberately does not delegate to :meth:`ProblemEnv.step`. That would
++        report ``correct``/``format`` metrics built from :meth:`check_answer`,
++        which is hardwired to ``False`` here — a metric reading "never correct"
++        when nothing was ever graded. It does reuse the parent's logtree layout,
++        because distillation otherwise leaves no record of what the student
++        wrote: the KL penalty is computed from tokens, and without this the
++        rollout logs carry lengths and rewards but no text.
++        """
++        message, termination = self.renderer.parse_response(action)
++        convo = self.convo_prefix + [{"role": "user", "content": self.get_question()}]
++        with logtree.scope_header("Prompt"):
++            logtree.log_formatter(ConversationFormatter(messages=convo))
++        with logtree.scope_header("Policy Response"):
++            logtree.log_formatter(ConversationFormatter(messages=[message]))
++        with logtree.scope_header("Termination"):
++            logtree.table_from_dict(
++                {
++                    "termination": termination.value,
++                    "clean": bool(termination.is_clean),
++                    "ac_len": len(action),
++                },
++                caption="A rollout cut off at max_tokens has no stop sequence, so it "
++                "parses as malformed",
++            )
++
+         return StepResult(
+             reward=0.0,
+             episode_done=True,
+diff --git a/b/tinker_cookbook/distillation/datasets_test.py b/tinker_cookbook/distillation/datasets_test.py
+new file mode 100644
+index 0000000..bf450e6
+--- /dev/null
++++ b/tinker_cookbook/distillation/datasets_test.py
+@@ -0,0 +1,90 @@
++"""Tests for the distillation environments' zero reward and rollout logging."""
++
++import json
++from pathlib import Path
++
++import pytest
++
++from tinker_cookbook import renderers
++from tinker_cookbook.distillation.datasets import PromptOnlyEnv
++from tinker_cookbook.renderers import ParseTermination
++from tinker_cookbook.utils import logtree
++
++PROMPT = "What is the smallest prime factor of 2027?"
++RESPONSE = "The number 2027 is prime, so the answer is 2027."
++
++
++class StubRenderer:
++    """Minimal renderer: parses a fixed response, avoiding a tokenizer download."""
++
++    def __init__(self, termination: ParseTermination = ParseTermination.STOP_SEQUENCE):
++        self._termination = termination
++
++    def parse_response(self, response: list[int]) -> tuple[renderers.Message, ParseTermination]:
++        assert response, "expected a non-empty action"
++        return {"role": "assistant", "content": RESPONSE}, self._termination
++
++    def get_stop_sequences(self) -> list[int]:
++        return []
++
++
++def _make_env(termination: ParseTermination = ParseTermination.STOP_SEQUENCE) -> PromptOnlyEnv:
++    renderer = StubRenderer(termination)
++    return PromptOnlyEnv(PROMPT, renderer)  # pyright: ignore[reportArgumentType]
++
++
++async def _step_and_capture(env: PromptOnlyEnv, tmp_path: Path) -> tuple[float, str]:
++    """Run one step inside a logtree trace, returning the reward and the trace text."""
++    html_path = tmp_path / "train.html"
++    with logtree.init_trace("test", path=str(html_path)) as trace:
++        result = await env.step([1, 2, 3])
++    return result.reward, json.dumps(trace.to_dict())
++
++
++@pytest.mark.asyncio
++async def test_reward_is_zero(tmp_path: Path) -> None:
++    # The KL penalty is added to whatever the env returns, so any nonzero reward
++    # here would quietly turn distillation into "GRPO + KL".
++    reward, _ = await _step_and_capture(_make_env(), tmp_path)
++    assert reward == 0.0
++
++
++@pytest.mark.asyncio
++async def test_reports_no_grading_metrics(tmp_path: Path) -> None:
++    # check_answer() is hardwired to False, so emitting "correct" would read as
++    # "never correct" rather than "never graded".
++    env = _make_env()
++    with logtree.init_trace("test", path=str(tmp_path / "train.html")):
++        result = await env.step([1, 2, 3])
++    assert result.metrics == {}
++
++
++@pytest.mark.asyncio
++async def test_logs_prompt_and_response_text(tmp_path: Path) -> None:
++    # Distillation supervises on tokens and grades nothing, so this trace is the
++    # only place a finished run records what the student actually wrote.
++    _, trace_text = await _step_and_capture(_make_env(), tmp_path)
++    assert PROMPT in trace_text
++    assert RESPONSE in trace_text
++
++
++@pytest.mark.asyncio
++async def test_logs_termination_so_truncation_is_visible(tmp_path: Path) -> None:
++    _, clean_text = await _step_and_capture(_make_env(), tmp_path)
++    assert ParseTermination.STOP_SEQUENCE.value in clean_text
++
++    # A rollout cut off at max_tokens never emits a stop sequence.
++    _, truncated_text = await _step_and_capture(
++        _make_env(ParseTermination.MALFORMED), tmp_path / "truncated"
++    )
++    assert ParseTermination.MALFORMED.value in truncated_text
++
++
++@pytest.mark.asyncio
++async def test_writes_html_transcript(tmp_path: Path) -> None:
++    env = _make_env()
++    html_path = tmp_path / "train.html"
++    with logtree.init_trace("test", path=str(html_path)):
++        await env.step([1, 2, 3])
++    assert html_path.exists(), "logtree should have written the HTML transcript"
++    assert RESPONSE in html_path.read_text()
+diff --git a/tinker_cookbook/distillation/train_on_policy.py b/tinker_cookbook/distillation/train_on_policy.py
+index f020c64..20d495e 100644
+--- a/tinker_cookbook/distillation/train_on_policy.py
++++ b/tinker_cookbook/distillation/train_on_policy.py
+@@ -32,6 +32,11 @@ from tinker_cookbook.rl.data_processing import (
+ )
+ from tinker_cookbook.rl.metric_util import RLTestSetEvaluator, compute_trajectory_metrics
+ from tinker_cookbook.rl.metrics import discounted_future_sum_vectorized
++from tinker_cookbook.rl.rollout_logging import (
++    RolloutSummaryGroup,
++    logtree_scope,
++    serialize_rollout_summaries_from_groups,
++)
+ from tinker_cookbook.rl.train import (
+     compute_full_batch_metrics_and_get_sampling_client,
+     do_group_rollout_and_filter_constant_reward,
+@@ -167,10 +172,51 @@ class Config:
+     save_every: int = 20
+     load_checkpoint_path: str | None = None
+ 
++    # Rollout logging, matching the knobs of the same name in rl/train.py.
++    # num_groups_to_log bounds how many groups produce readable transcripts
++    # (iteration_*/train.html); rollout_json_export controls the per-trajectory
++    # JSONL summaries, which cover every group in the batch.
++    num_groups_to_log: int = 4
++    rollout_json_export: bool = True
++
+     # Maximum number of training steps. If None, train on the full dataset.
+     max_steps: int | None = None
+ 
+ 
++def _maybe_export_rollout_summary_jsonl(
++    *,
++    config: Config,
++    iteration: int,
++    env_group_builders_P: Sequence[EnvGroupBuilder],
++    trajectory_groups_P: Sequence[TrajectoryGroup],
++    store: TrainingRunStore | None,
++) -> None:
++    """Write per-trajectory rollout summaries for the batch when enabled.
++
++    Unlike the logtree HTML, which is capped at ``num_groups_to_log`` groups,
++    this covers every group in the batch: it is the only place a completed run
++    records per-trajectory action lengths, so it is what makes truncation at
++    ``max_tokens`` measurable after the fact.
++    """
++    if not config.rollout_json_export or store is None:
++        return
++    records = serialize_rollout_summaries_from_groups(
++        split="train",
++        iteration=iteration,
++        groups_P=[
++            RolloutSummaryGroup(
++                trajectory_group=trajectory_group,
++                tags=env_group_builder.logging_tags(),
++                sampling_client_step=iteration,
++            )
++            for env_group_builder, trajectory_group in safezip(
++                env_group_builders_P, trajectory_groups_P
++            )
++        ],
++    )
++    store.write_rollouts(iteration, records, base_name="train")
++
++
+ @trace.scope
+ async def prepare_minibatch(
+     env_group_builders_P: Sequence[EnvGroupBuilder],
+@@ -320,27 +366,70 @@ async def do_sync_training(
+ 
+             # Get batch and sample trajectories
+             env_group_builders_P, dataset_indices_P = dataset.get_batch(i_batch)
+-            async with trace.scope_span("sample"):
+-                trajectory_groups_P = await asyncio.gather(
+-                    *[
+-                        asyncio.create_task(
+-                            do_group_rollout_and_filter_constant_reward(
+-                                sampling_client,
+-                                builder,
+-                                temperature=config.temperature,
+-                                max_tokens=config.max_tokens,
+-                                do_remove_constant_reward_groups=False,
+-                            ),
+-                            name=f"sample_task_{i}",
+-                        )
+-                        for i, builder in enumerate(env_group_builders_P)
+-                    ],
++            iter_dir = iteration_dir(log_path, i_batch)
++            with logtree_scope(
++                output_dir=iter_dir,
++                num_groups_to_log=config.num_groups_to_log,
++                f_name="train",
++                scope_name=f"Sampling rollouts {i_batch}",
++                iteration=i_batch,
++                store=ml_logger.store,
++            ):
++                async with trace.scope_span("sample"):
++                    trajectory_groups_P = await asyncio.gather(
++                        *[
++                            asyncio.create_task(
++                                do_group_rollout_and_filter_constant_reward(
++                                    sampling_client,
++                                    builder,
++                                    temperature=config.temperature,
++                                    max_tokens=config.max_tokens,
++                                    do_remove_constant_reward_groups=False,
++                                    enable_logging=i < config.num_groups_to_log,
++                                ),
++                                name=f"sample_task_{i}",
++                            )
++                            for i, builder in enumerate(env_group_builders_P)
++                        ],
++                    )
++            # A group comes back None only when its rollouts failed outright
++            # (constant-reward filtering is disabled above). Drop the group's
++            # builder and dataset index alongside it: prepare_minibatch pairs
++            # these three lists positionally to build tags and to route teacher
++            # clients, and those pairings use plain zip / index lookups, so an
++            # unaligned batch would corrupt metrics and teacher routing silently
++            # rather than raising.
++            kept_P = [
++                (builder, group, dataset_idx)
++                for builder, group, dataset_idx in safezip(
++                    env_group_builders_P, trajectory_groups_P, dataset_indices_P
+                 )
+-            trajectory_groups_P = [
+-                trajectory_group
+-                for trajectory_group in trajectory_groups_P
+-                if trajectory_group is not None
++                if group is not None
+             ]
++            num_dropped = len(trajectory_groups_P) - len(kept_P)
++            if num_dropped > 0:
++                logger.warning(
++                    "Dropping %d/%d trajectory groups at step %d whose rollouts failed",
++                    num_dropped,
++                    len(trajectory_groups_P),
++                    i_batch,
++                )
++            assert kept_P, (
++                f"All {len(trajectory_groups_P)} trajectory groups failed at step {i_batch}; "
++                "there is nothing to train on"
++            )
++            metrics["sample/num_groups_dropped"] = num_dropped
++            env_group_builders_P = [builder for builder, _, _ in kept_P]
++            trajectory_groups_P = [group for _, group, _ in kept_P]
++            dataset_indices_P = [dataset_idx for _, _, dataset_idx in kept_P]
++
++            _maybe_export_rollout_summary_jsonl(
++                config=config,
++                iteration=i_batch,
++                env_group_builders_P=env_group_builders_P,
++                trajectory_groups_P=trajectory_groups_P,
++                store=ml_logger.store,
++            )
+ 
+             # Train step
+             sampling_client, train_step_metrics = await do_train_step_and_get_sampling_client(
+diff --git a/tinker_cookbook/eval/benchmarks/aime.py b/tinker_cookbook/eval/benchmarks/aime.py
+index f040c75..dacc319 100644
+--- a/tinker_cookbook/eval/benchmarks/aime.py
++++ b/tinker_cookbook/eval/benchmarks/aime.py
+@@ -1,6 +1,7 @@
+ """AIME benchmarks -- math competition problems with integer answers (0-999).
+ 
+ Provides separate benchmarks for each year:
++- ``aime_2024``: AIME 2024 (30 problems)
+ - ``aime_2025``: AIME 2025 (30 problems)
+ - ``aime_2026``: AIME 2026 (30 problems)
+ - ``aime``: Alias for ``aime_2025`` (backward compatibility)
+@@ -39,8 +40,11 @@ from tinker_cookbook.rl.types import Env
+ 
+ logger = logging.getLogger(__name__)
+ 
+-# Pinned dataset source per year (MathArena — verified against published scores)
++# Pinned dataset source per year. 2025/2026 come from MathArena (verified
++# against published scores); 2024 predates MathArena's coverage, so it uses the
++# HuggingFaceH4 mirror — the same 30 problems, but not score-verified here.
+ _AIME_DATASETS: dict[str, str] = {
++    "2024": "HuggingFaceH4/aime_2024",
+     "2025": "MathArena/aime_2025",
+     "2026": "MathArena/aime_2026",
+ }
+@@ -180,6 +184,7 @@ class _AIMEBenchmarkBuilder(BenchmarkBuilder):
+ # Auto-register
+ from tinker_cookbook.eval.benchmarks import register  # noqa: E402
+ 
++register(_AIMEBenchmarkBuilder("2024", "aime_2024"))
+ register(_AIMEBenchmarkBuilder("2025", "aime_2025"))
+ register(_AIMEBenchmarkBuilder("2026", "aime_2026"))
+ # Backward-compatible alias: "aime" -> AIME 2025
+diff --git a/b/tinker_cookbook/recipes/distillation/deepmath_zero_reward.py b/tinker_cookbook/recipes/distillation/deepmath_zero_reward.py
+new file mode 100644
+index 0000000..599ee0b
+--- /dev/null
++++ b/tinker_cookbook/recipes/distillation/deepmath_zero_reward.py
+@@ -0,0 +1,99 @@
++"""Zero-reward DeepMath dataset, for comparing on-policy distillation against RL.
++
++On-policy distillation must take its entire training signal from the teacher KL:
++:func:`tinker_cookbook.distillation.train_on_policy.incorporate_kl_penalty` *adds*
++the KL advantage to whatever advantage the environment produced, so a nonzero
++environment reward would silently turn distillation into "RL plus KL".
++
++The stock distillation dataset (:class:`PromptOnlyDataset`) achieves a zero reward
++by dropping the answer entirely, but it also asks a different question than
++:class:`MathEnv` does: no ``\\boxed{}`` instruction, a 1024-token prompt
++truncation, and no shuffle of the underlying rows. Those differences make it
++unsuitable as a control for a DeepMath RL run.
++
++This module instead derives its environments from :class:`DeepMathDataset`, so
++the prompt text, the row filtering, and the shuffle order are identical to the
++RL arm by construction. Only the reward is replaced. Grading still runs, so
++DeepMath correctness is reported as a metric for both arms — the distillation
++arm is measured on correctness without ever training on it.
++"""
++
++import dataclasses
++from collections.abc import Sequence
++from functools import partial
++
++import chz
++
++from tinker_cookbook import renderers
++from tinker_cookbook.recipes.math_rl.math_env import DeepMathDataset, MathEnv
++from tinker_cookbook.rl.problem_env import ProblemGroupBuilder
++from tinker_cookbook.rl.types import (
++    Action,
++    ActionExtra,
++    RLDatasetBuilder,
++    StepResult,
++)
++from tinker_cookbook.tokenizer_utils import get_tokenizer
++
++
++class ZeroRewardMathEnv(MathEnv):
++    """A :class:`MathEnv` that grades the response but reports zero reward."""
++
++    async def step(self, action: Action, *, extra: ActionExtra | None = None) -> StepResult:
++        result = await super().step(action, extra=extra)
++        assert "correct" in result.metrics and "format" in result.metrics, (
++            "MathEnv is expected to report 'correct' and 'format' metrics; "
++            f"got {sorted(result.metrics)}. Grading must stay observable even "
++            "though it no longer contributes to the reward."
++        )
++        return dataclasses.replace(result, reward=0.0)
++
++
++class ZeroRewardDeepMathDataset(DeepMathDataset):
++    """DeepMath with :class:`ZeroRewardMathEnv` in place of :class:`MathEnv`."""
++
++    def _make_env_group_builder(
++        self, x: dict[str, str], group_size: int
++    ) -> ProblemGroupBuilder | None:
++        builder = super()._make_env_group_builder(x, group_size)
++        if builder is None:
++            # Mirror the parent's row filtering rather than raising, so both arms
++            # of a comparison train on exactly the same set of problems.
++            return None
++        env_thunk = builder.env_thunk
++        assert isinstance(env_thunk, partial) and env_thunk.func is MathEnv, (
++            "Expected DeepMathDataset to build MathEnv via functools.partial, got "
++            f"{env_thunk!r}. Swapping in the zero-reward env relies on that shape; "
++            "if the parent changed, this override must be updated to match."
++        )
++        return dataclasses.replace(
++            builder,
++            env_thunk=partial(ZeroRewardMathEnv, *env_thunk.args, **env_thunk.keywords),
++        )
++
++    def get_batch(self, index: int) -> Sequence[ProblemGroupBuilder]:
++        builders = super().get_batch(index)
++        assert len(builders) > 0, f"DeepMath batch {index} produced no environment groups"
++        return builders  # pyright: ignore[reportReturnType]
++
++
++@chz.chz
++class ZeroRewardDeepMathDatasetBuilder(RLDatasetBuilder):
++    """Mirrors ``DeepMathDatasetBuilder`` so both arms accept the same arguments."""
++
++    batch_size: int
++    model_name_for_tokenizer: str
++    renderer_name: str
++    group_size: int
++    seed: int = 0
++
++    async def __call__(self) -> tuple[ZeroRewardDeepMathDataset, None]:
++        assert self.batch_size > 0, f"batch_size must be positive, got {self.batch_size}"
++        assert self.group_size > 0, f"group_size must be positive, got {self.group_size}"
++        tokenizer = get_tokenizer(self.model_name_for_tokenizer)
++        return ZeroRewardDeepMathDataset(
++            batch_size=self.batch_size,
++            group_size=self.group_size,
++            renderer=renderers.get_renderer(self.renderer_name, tokenizer=tokenizer),
++            seed=self.seed,
++        ), None
+diff --git a/b/tinker_cookbook/recipes/distillation/deepmath_zero_reward_test.py b/tinker_cookbook/recipes/distillation/deepmath_zero_reward_test.py
+new file mode 100644
+index 0000000..c995daf
+--- /dev/null
++++ b/tinker_cookbook/recipes/distillation/deepmath_zero_reward_test.py
+@@ -0,0 +1,121 @@
++"""Unit tests for the zero-reward DeepMath environment.
++
++These tests use a scripted renderer and bypass the DeepMath download, so they
++run without network access or a Tinker API key.
++"""
++
++import asyncio
++from functools import partial
++from typing import Any
++
++import pytest
++import tinker
++
++from tinker_cookbook.recipes.distillation.deepmath_zero_reward import (
++    ZeroRewardDeepMathDataset,
++    ZeroRewardMathEnv,
++)
++from tinker_cookbook.recipes.math_rl.math_env import MathEnv
++from tinker_cookbook.renderers import Message, ParseTermination
++
++PROBLEM = "What is 2 + 2?"
++ANSWER = "4"
++
++
++class ScriptedRenderer:
++    """Fake renderer: records the prompts it is asked to build, replays parses."""
++
++    def __init__(self, parse_result: tuple[Message, ParseTermination]):
++        self._parse_result = parse_result
++        self.prompts: list[list[Message]] = []
++
++    def get_stop_sequences(self) -> list[str]:
++        return ["<stop>"]
++
++    def build_generation_prompt(self, messages: list[Message], **kwargs: Any) -> tinker.ModelInput:
++        self.prompts.append(list(messages))
++        return tinker.ModelInput.from_ints([1, 2, 3])
++
++    def parse_response(self, action: list[int]) -> tuple[Message, ParseTermination]:
++        return self._parse_result
++
++
++def _correct_response() -> tuple[Message, ParseTermination]:
++    message: Message = {"role": "assistant", "content": f"The answer is \\boxed{{{ANSWER}}}"}
++    return message, ParseTermination.STOP_SEQUENCE
++
++
++def _make_envs() -> tuple[MathEnv, ZeroRewardMathEnv, ScriptedRenderer, ScriptedRenderer]:
++    graded_renderer = ScriptedRenderer(_correct_response())
++    zero_renderer = ScriptedRenderer(_correct_response())
++    graded = MathEnv(PROBLEM, ANSWER, graded_renderer)  # pyright: ignore[reportArgumentType]
++    zero = ZeroRewardMathEnv(PROBLEM, ANSWER, zero_renderer)  # pyright: ignore[reportArgumentType]
++    return graded, zero, graded_renderer, zero_renderer
++
++
++class TestPromptParity:
++    def test_question_text_is_identical(self):
++        graded, zero, _, _ = _make_envs()
++        assert zero.get_question() == graded.get_question()
++        assert "\\boxed{}" in zero.get_question()
++
++    def test_generation_prompt_is_identical(self):
++        graded, zero, graded_renderer, zero_renderer = _make_envs()
++        asyncio.run(graded.initial_observation())
++        asyncio.run(zero.initial_observation())
++        assert zero_renderer.prompts == graded_renderer.prompts
++
++
++class TestZeroReward:
++    def test_graded_env_rewards_a_correct_answer(self):
++        graded, _, _, _ = _make_envs()
++        result = asyncio.run(graded.step([1, 2, 3]))
++        assert result.reward > 0.0
++        assert result.metrics["correct"] == 1.0
++
++    def test_zero_reward_env_reports_no_reward(self):
++        _, zero, _, _ = _make_envs()
++        result = asyncio.run(zero.step([1, 2, 3]))
++        assert result.reward == 0.0
++
++    def test_grading_metrics_survive(self):
++        graded, zero, _, _ = _make_envs()
++        graded_result = asyncio.run(graded.step([1, 2, 3]))
++        zero_result = asyncio.run(zero.step([1, 2, 3]))
++        assert zero_result.metrics == graded_result.metrics
++        assert zero_result.episode_done == graded_result.episode_done
++
++
++class TestDatasetEnvSwap:
++    """Exercises the env swap without loading the 103K-row DeepMath dataset."""
++
++    def _dataset(self) -> ZeroRewardDeepMathDataset:
++        dataset = object.__new__(ZeroRewardDeepMathDataset)
++        dataset.renderer = ScriptedRenderer(_correct_response())  # pyright: ignore[reportAttributeAccessIssue]
++        dataset.convo_prefix = None
++        return dataset
++
++    def test_swaps_in_zero_reward_env(self):
++        builder = self._dataset()._make_env_group_builder(
++            {"question": PROBLEM, "final_answer": ANSWER}, group_size=4
++        )
++        assert builder is not None
++        assert builder.num_envs == 4
++        assert builder.dataset_name == "deepmath"
++        assert isinstance(builder.env_thunk, partial)
++        assert builder.env_thunk.func is ZeroRewardMathEnv
++        env = builder.env_thunk()
++        assert isinstance(env, ZeroRewardMathEnv)
++        assert env.get_question() == MathEnv(PROBLEM, ANSWER, env.renderer).get_question()
++
++    @pytest.mark.parametrize(
++        "row",
++        [
++            {"question": "", "final_answer": ANSWER},
++            {"question": PROBLEM, "final_answer": ""},
++        ],
++    )
++    def test_mirrors_parent_row_filtering(self, row: dict[str, str]):
++        # Rows the RL arm drops must also be dropped here, so both arms of a
++        # comparison train on the same problems.
++        assert self._dataset()._make_env_group_builder(row, group_size=4) is None
+diff --git a/b/tinker_cookbook/recipes/distillation/opd_vs_grpo.py b/tinker_cookbook/recipes/distillation/opd_vs_grpo.py
+new file mode 100644
+index 0000000..37b48ae
+--- /dev/null
++++ b/tinker_cookbook/recipes/distillation/opd_vs_grpo.py
+@@ -0,0 +1,445 @@
++"""Compare on-policy distillation against GRPO on DeepMath from a shared SFT init.
++
++Both arms are launched from this one entrypoint so that every knob they have in
++common — student checkpoint, group size, rollout length, learning rate,
++temperature, evaluation — is set in exactly one place and cannot drift between
++runs. The intended difference is the training signal:
++
++  ``method=grpo``  correctness/format reward from ``MathEnv``, no teacher.
++  ``method=opd``   zero reward, advantages come entirely from the teacher KL.
++
++``opd_dataset`` controls a real tradeoff between controlling the comparison and
++reproducing this recipe's README:
++
++  ``matched`` (default) drives both arms from the same ``DeepMathDataset``, so
++      the question text (including ``MathEnv``'s ``\\boxed{}`` instruction),
++      problem order, prompt truncation, and grading are all identical, leaving
++      the training signal as the only difference. The distillation arm runs
++      ``ZeroRewardMathEnv``, which grades for metrics but reports zero reward.
++      Deviates from the README's dataset handling.
++
++  ``prompt_only`` is what the README's on-policy distillation command runs: bare
++      DeepMath questions via ``PromptOnlyDatasetBuilder``, truncated to 1024
++      prompt tokens, in raw dataset order. Faithful to the published recipe, but
++      the GRPO arm then asks a different question over a different, shuffled
++      slice of DeepMath, so prompt text and problem selection are confounded
++      with the training signal, and the OPD arm reports no correctness metric.
++
++Example usage:
++    export TINKER_API_KEY=...   # billed account; also holds the checkpoints
++    export WANDB_API_KEY=...    # required unless wandb_project=None
++
++    python -m tinker_cookbook.recipes.distillation.opd_vs_grpo method=grpo
++    python -m tinker_cookbook.recipes.distillation.opd_vs_grpo method=opd
++
++Note that the LoRA rank is inherited from ``load_checkpoint_path`` — both
++trainers call ``create_training_client_from_state_async``, which ignores the
++``lora_rank`` field. The default checkpoint below is the rank-128 SFT run
++published in this recipe's README.
++"""
++
++import asyncio
++import importlib.util
++import logging
++import math
++import os
++from datetime import datetime
++from pathlib import Path
++from typing import Literal
++
++import chz
++
++from tinker_cookbook import checkpoint_utils, cli_utils, renderers
++from tinker_cookbook.distillation import train_on_policy
++from tinker_cookbook.distillation.datasets import (
++    DistillationDatasetConfig,
++    PromptOnlyDatasetBuilder,
++    TeacherConfig,
++)
++from tinker_cookbook.eval.benchmarks import REGISTRY
++from tinker_cookbook.eval.benchmarks._runner import _ensure_registered
++from tinker_cookbook.eval.evaluators import SamplingClientEvaluatorBuilder
++from tinker_cookbook.recipes.distillation.deepmath_zero_reward import (
++    ZeroRewardDeepMathDatasetBuilder,
++)
++from tinker_cookbook.recipes.distillation.saving_benchmark_evaluator import (
++    SavingBenchmarkEvaluator,
++)
++from tinker_cookbook.recipes.math_rl.math_env import DeepMathDatasetBuilder
++from tinker_cookbook.rl import train as rl_train
++from tinker_cookbook.rl.types import RLDatasetBuilder
++from tinker_cookbook.tokenizer_utils import get_tokenizer
++
++logger = logging.getLogger(__name__)
++
++# Rank-128 supervised fine-tuning checkpoint from recipes/distillation/README.md.
++SFT_RANK128_CHECKPOINT = "tinker://b89f6676-49c4-53ed-9788-2e0c81a9eabf:train:0/weights/final"
++
++# Deliberately not under /tmp: these runs cost real money and their logs, rollout
++# transcripts, and eval generations are the only local record of them, while
++# macOS prunes /tmp periodically and can clear it on reboot.
++LOG_ROOT = "~/tinker-runs/opd_vs_grpo"
++
++Method = Literal["opd", "grpo"]
++OPDDataset = Literal["prompt_only", "matched"]
++
++
++@chz.chz
++class CLIConfig:
++    """Shared configuration for both arms of the comparison."""
++
++    method: Method
++
++    # Models. The student starts from an SFT checkpoint; the teacher is only
++    # used by the distillation arm.
++    student_model: str = "Qwen/Qwen3.5-9B-Base"
++    teacher_model: str = "Qwen/Qwen3.5-9B"
++    load_checkpoint_path: str = SFT_RANK128_CHECKPOINT
++    teacher_checkpoint: str | None = None
++    # Left as None, the renderer is read from the checkpoint's metadata.
++    renderer_name: str | None = None
++    # The renderer the SFT checkpoint was trained with. off_policy_reasoning.py
++    # pins "qwen3_5" rather than the base model's recommended renderer
++    # ("role_colon"), so that the student shares a format with the instruct
++    # teacher — the teacher's logprobs are computed on the student's own
++    # rendered tokens. Resolving to anything else means the checkpoint metadata
++    # is missing and we silently fell back to the base default, which would
++    # make the KL meaningless. Set to None to skip the check.
++    expected_renderer_name: str | None = "qwen3_5"
++
++    # Which dataset the distillation arm uses. See the module docstring for the
++    # comparison-control vs README-fidelity tradeoff.
++    opd_dataset: OPDDataset = "matched"
++
++    # Training. Identical for both arms. The README ties its reported score to
++    # 16k-token rollouts.
++    groups_per_batch: int = 64
++    group_size: int = 4
++    max_tokens: int = 16384
++    learning_rate: float = 1e-4
++    temperature: float = 1.0
++    num_train_steps: int = 20
++    seed: int = 0
++
++    # Distillation-only. The KL is the entire training signal for method=opd.
++    kl_penalty_coef: float = 1.0
++    kl_discount_factor: float = 0.0
++
++    # Evaluation. Runs at step 0 (the SFT baseline) and every eval_every steps.
++    # aime_2024 is the metric the README reports. It has only 30 problems, so a
++    # single draw per problem is far too noisy to resolve 20 steps of training:
++    # one problem moves the score by 3.3%, and the run-to-run spread at
++    # temperature 1.0 is wider than any effect we expect. eval_num_samples
++    # averages several draws per problem instead (the reported score becomes the
++    # mean over draws), which cuts that noise for a few dollars.
++    eval_benchmarks: tuple[str, ...] = ("aime_2024",)
++    eval_every: int = 5
++    eval_max_examples: int = 200
++    eval_num_samples: int = 8
++    # Kept at the training rollout length so eval is not the tighter cap. The
++    # README evaluated AIME'24 at 64000 tokens; raise this to close that gap.
++    eval_max_tokens: int = 16384
++    # The README's other three eval settings are matched: temperature=1.0 here,
++    # and top_p=1.0 / top_k=-1 are the SDK defaults that TinkerTokenCompleter
++    # leaves untouched.
++    eval_temperature: float = 1.0
++    # BenchmarkConfig defaults to 300s, which a 16k-token reasoning rollout can
++    # exceed. A timed-out example is scored 0 rather than counted as truncated,
++    # and it would hit whichever arm generates longer outputs harder, so the
++    # limit has to sit well above the time eval_max_tokens actually takes.
++    eval_timeout_seconds: float = 1800
++
++    save_every: int = 10
++    log_path: str | None = None
++    # On by default: the local log directory is the only other record of a run
++    # that costs real money, and W&B is account-independent of the Tinker key —
++    # it streams to whoever owns WANDB_API_KEY. Scalars and the resolved config
++    # only; rollout text stays in local files. Set to None to disable.
++    wandb_project: str | None = "opd_vs_grpo"
++    wandb_name: str | None = None
++    # Trajectory groups whose prompt and response *text* is written to
++    # ``iteration_*/train.html`` and its logtree JSON. The rollout summaries
++    # (rewards, lengths) always cover the full batch; this is the text. None
++    # means every group, which is what makes the generations reviewable rather
++    # than just countable — at 16k-token rollouts that is a few hundred MB per
++    # arm. Set an integer to keep only the first N groups per step.
++    num_groups_to_log: int | None = None
++    base_url: str | None = None
++    behavior_if_log_dir_exists: cli_utils.LogdirBehavior = "ask"
++
++
++def _build_opd_dataset_builder(cli_config: CLIConfig, renderer_name: str) -> RLDatasetBuilder:
++    """Build the distillation arm's dataset, honoring the README/control tradeoff."""
++    assert cli_config.opd_dataset in ("prompt_only", "matched"), (
++        f"unknown opd_dataset {cli_config.opd_dataset!r}"
++    )
++    if cli_config.opd_dataset == "prompt_only":
++        # The README's command: bare prompts, 1024-token truncation, dataset order.
++        return PromptOnlyDatasetBuilder(
++            dataset_name="deepmath",
++            groups_per_batch=cli_config.groups_per_batch,
++            group_size=cli_config.group_size,
++            model_name_for_tokenizer=cli_config.student_model,
++            renderer_name=renderer_name,
++        )
++    return ZeroRewardDeepMathDatasetBuilder(
++        batch_size=cli_config.groups_per_batch,
++        model_name_for_tokenizer=cli_config.student_model,
++        renderer_name=renderer_name,
++        group_size=cli_config.group_size,
++        seed=cli_config.seed,
++    )
++
++
++def _first_eval_step(log_path: str, eval_every: int) -> int:
++    """Return the training step at which the next run's first evaluation lands.
++
++    Both trainers resume by reading the last record in ``checkpoints.jsonl``
++    under ``log_path`` and evaluating on steps where ``i_batch % eval_every == 0``.
++    Resolving the same number here keeps the evaluator's per-step output
++    directories labeled with real training steps across a resume, instead of
++    restarting at 0 and colliding with the previous run's directories.
++    """
++    resume_info = checkpoint_utils.get_last_checkpoint(log_path)
++    start_batch = resume_info.batch if resume_info else 0
++    assert start_batch >= 0, f"resumed start step must be non-negative, got {start_batch}"
++    if start_batch > 0:
++        logger.info(
++            "Found a checkpoint at step %d in %s; evaluations will resume at step %d",
++            start_batch,
++            log_path,
++            math.ceil(start_batch / eval_every) * eval_every,
++        )
++    return math.ceil(start_batch / eval_every) * eval_every
++
++
++def _build_evaluator_builders(
++    cli_config: CLIConfig, renderer: renderers.Renderer, log_path: str
++) -> list[SamplingClientEvaluatorBuilder]:
++    assert len(cli_config.eval_benchmarks) > 0, (
++        "at least one eval benchmark is required; the two arms need a comparable metric"
++    )
++    # REGISTRY is populated lazily by module import, so resolve each name before
++    # deciding it is unknown — this is what run_benchmark does internally.
++    for name in cli_config.eval_benchmarks:
++        _ensure_registered(name)
++    unknown = [name for name in cli_config.eval_benchmarks if name not in REGISTRY]
++    assert not unknown, (
++        f"unknown benchmark(s) {unknown}; registered benchmarks are {sorted(REGISTRY)}"
++    )
++
++    first_eval_step = _first_eval_step(log_path, cli_config.eval_every)
++
++    def make_builder(name: str) -> SamplingClientEvaluatorBuilder:
++        return lambda: SavingBenchmarkEvaluator(
++            name,
++            renderer,
++            save_root=Path(log_path) / "evals" / name,
++            eval_every=cli_config.eval_every,
++            first_eval_step=first_eval_step,
++            num_samples=cli_config.eval_num_samples,
++            max_examples=cli_config.eval_max_examples,
++            max_tokens=cli_config.eval_max_tokens,
++            temperature=cli_config.eval_temperature,
++            timeout_seconds=cli_config.eval_timeout_seconds,
++        )
++
++    return [make_builder(name) for name in cli_config.eval_benchmarks]
++
++
++async def build_config(
++    cli_config: CLIConfig,
++) -> rl_train.Config | train_on_policy.Config:
++    """Resolve the CLI config into the trainer config for the requested arm."""
++    assert cli_config.method in ("opd", "grpo"), f"unknown method {cli_config.method!r}"
++    assert cli_config.num_train_steps > 0, "num_train_steps must be positive"
++    assert cli_config.eval_every > 0, (
++        "eval_every must be positive; without evaluation the two arms have no comparable metric"
++    )
++    # Both trainers evaluate at the top of iteration i_batch, before that
++    # iteration trains. Running one extra iteration therefore yields an
++    # evaluation that reflects exactly num_train_steps completed updates.
++    assert cli_config.num_train_steps % cli_config.eval_every == 0, (
++        f"eval_every ({cli_config.eval_every}) must divide num_train_steps "
++        f"({cli_config.num_train_steps}) so the final evaluation lands on the last step"
++    )
++    max_steps = cli_config.num_train_steps + 1
++
++    renderer_name = await checkpoint_utils.resolve_renderer_name_from_checkpoint_or_default_async(
++        model_name=cli_config.student_model,
++        explicit_renderer_name=cli_config.renderer_name,
++        load_checkpoint_path=cli_config.load_checkpoint_path,
++        base_url=cli_config.base_url,
++    )
++    if cli_config.expected_renderer_name is not None:
++        assert renderer_name == cli_config.expected_renderer_name, (
++            f"resolved renderer {renderer_name!r} but expected "
++            f"{cli_config.expected_renderer_name!r} for checkpoint "
++            f"{cli_config.load_checkpoint_path}. The student and teacher must share a "
++            "render format for the teacher KL to be meaningful. Pass "
++            "renderer_name=<name> to override, or expected_renderer_name=None to skip "
++            "this check."
++        )
++    tokenizer = get_tokenizer(cli_config.student_model)
++    renderer = renderers.get_renderer(renderer_name, tokenizer=tokenizer)
++
++    if cli_config.log_path is not None:
++        log_path = str(Path(cli_config.log_path).expanduser())
++    else:
++        student = cli_config.student_model.replace("/", "-")
++        arm = f"opd_{cli_config.opd_dataset}" if cli_config.method == "opd" else cli_config.method
++        run_name = (
++            f"{arm}-deepmath-{student}-"
++            f"{cli_config.learning_rate}lr-{cli_config.groups_per_batch}x{cli_config.group_size}-"
++            f"{cli_config.max_tokens}tok-seed{cli_config.seed}-"
++            f"{datetime.now().strftime('%Y-%m-%d-%H-%M')}"
++        )
++        log_path = str(Path(LOG_ROOT).expanduser() / run_name)
++    # Everything downstream joins onto this path, so it has to be expanded here
++    # rather than relying on the trainer Config's munger.
++    assert "~" not in log_path, f"log_path was not expanded: {log_path}"
++    wandb_name = cli_config.wandb_name or Path(log_path).name
++    evaluator_builders = _build_evaluator_builders(cli_config, renderer, log_path)
++
++    # None means "every group"; resolved here so the value recorded in
++    # config.json is the literal number of groups logged.
++    num_groups_to_log = (
++        cli_config.groups_per_batch
++        if cli_config.num_groups_to_log is None
++        else cli_config.num_groups_to_log
++    )
++    assert 0 <= num_groups_to_log <= cli_config.groups_per_batch, (
++        f"num_groups_to_log ({num_groups_to_log}) must be between 0 and "
++        f"groups_per_batch ({cli_config.groups_per_batch})"
++    )
++
++    logger.info(
++        "Launching %s: student=%s from %s, %d groups x %d rollouts, max_tokens=%d, "
++        "lr=%s, %d steps (LoRA rank is inherited from the checkpoint)",
++        cli_config.method,
++        cli_config.student_model,
++        cli_config.load_checkpoint_path,
++        cli_config.groups_per_batch,
++        cli_config.group_size,
++        cli_config.max_tokens,
++        cli_config.learning_rate,
++        cli_config.num_train_steps,
++    )
++
++    if cli_config.method == "grpo":
++        config = rl_train.Config(
++            learning_rate=cli_config.learning_rate,
++            dataset_builder=DeepMathDatasetBuilder(
++                batch_size=cli_config.groups_per_batch,
++                model_name_for_tokenizer=cli_config.student_model,
++                renderer_name=renderer_name,
++                group_size=cli_config.group_size,
++                seed=cli_config.seed,
++            ),
++            model_name=cli_config.student_model,
++            recipe_name="recipe_distillation_opd_vs_grpo",
++            renderer_name=renderer_name,
++            max_tokens=cli_config.max_tokens,
++            temperature=cli_config.temperature,
++            load_checkpoint_path=cli_config.load_checkpoint_path,
++            evaluator_builders=evaluator_builders,
++            # Keep every group, so the effective batch size matches the
++            # distillation arm (whose rewards are constant by construction).
++            remove_constant_reward_groups=False,
++            eval_every=cli_config.eval_every,
++            save_every=cli_config.save_every,
++            max_steps=max_steps,
++            log_path=log_path,
++            num_groups_to_log=num_groups_to_log,
++            wandb_project=cli_config.wandb_project,
++            wandb_name=wandb_name,
++            base_url=cli_config.base_url,
++        )
++    else:
++        assert cli_config.kl_penalty_coef > 0, (
++            "on-policy distillation takes its entire training signal from the teacher KL, "
++            f"but kl_penalty_coef={cli_config.kl_penalty_coef}"
++        )
++        config = train_on_policy.Config(
++            learning_rate=cli_config.learning_rate,
++            dataset_configs=[
++                DistillationDatasetConfig(
++                    dataset_builder=_build_opd_dataset_builder(cli_config, renderer_name),
++                    teacher_config=TeacherConfig(
++                        base_model=cli_config.teacher_model,
++                        load_checkpoint_path=cli_config.teacher_checkpoint,
++                    ),
++                    groups_per_batch=cli_config.groups_per_batch,
++                )
++            ],
++            model_name=cli_config.student_model,
++            recipe_name="recipe_distillation_opd_vs_grpo",
++            renderer_name=renderer_name,
++            max_tokens=cli_config.max_tokens,
++            temperature=cli_config.temperature,
++            load_checkpoint_path=cli_config.load_checkpoint_path,
++            evaluator_builders=evaluator_builders,
++            kl_penalty_coef=cli_config.kl_penalty_coef,
++            kl_discount_factor=cli_config.kl_discount_factor,
++            eval_every=cli_config.eval_every,
++            save_every=cli_config.save_every,
++            max_steps=max_steps,
++            log_path=log_path,
++            num_groups_to_log=num_groups_to_log,
++            wandb_project=cli_config.wandb_project,
++            wandb_name=wandb_name,
++            base_url=cli_config.base_url,
++        )
++
++    return config
++
++
++def _assert_wandb_ready(wandb_project: str | None) -> None:
++    """Fail before launch if W&B is requested but cannot actually log.
++
++    ``ml_log.setup_logging`` degrades quietly here: a missing ``wandb`` package
++    or an unset ``WANDB_API_KEY`` only prints a warning and drops the logger,
++    which scrolls past in startup noise. The failure would then surface hours
++    and many dollars later as an empty project, so this turns it into a startup
++    error instead.
++    """
++    if wandb_project is None:
++        return
++    if importlib.util.find_spec("wandb") is None:
++        raise RuntimeError(
++            f"wandb_project={wandb_project!r} but the wandb package is not installed; "
++            "run `uv sync --extra wandb` (or pass wandb_project=None to opt out)"
++        )
++    api_key = os.environ.get("WANDB_API_KEY")
++    if not api_key:
++        raise RuntimeError(
++            f"wandb_project={wandb_project!r} but WANDB_API_KEY is not set, so metrics "
++            "would silently go nowhere. Export the key from wandb.ai/authorize "
++            "(or pass wandb_project=None to opt out)."
++        )
++    # A "local-" key belongs to a self-hosted W&B Server. Without WANDB_BASE_URL,
++    # the client talks to https://api.wandb.ai, which rejects it with a 401 that
++    # reads like a bad key rather than a misrouted one.
++    if api_key.startswith("local-") and not os.environ.get("WANDB_BASE_URL"):
++        raise RuntimeError(
++            "WANDB_API_KEY is a self-hosted ('local-') key but WANDB_BASE_URL is not "
++            "set, so the client would authenticate against https://api.wandb.ai and "
++            "fail with 401. Export WANDB_BASE_URL=https://<your-wandb-server>."
++        )
++
++
++async def cli_main(cli_config: CLIConfig):
++    _assert_wandb_ready(cli_config.wandb_project)
++    config = await build_config(cli_config)
++    cli_utils.check_log_dir(
++        config.log_path, behavior_if_exists=cli_config.behavior_if_log_dir_exists
++    )
++    if isinstance(config, rl_train.Config):
++        await rl_train.main(config)
++    else:
++        await train_on_policy.main(config)
++
++
++if __name__ == "__main__":
++    cli_config = chz.entrypoint(CLIConfig)
++    asyncio.run(cli_main(cli_config))
+diff --git a/b/tinker_cookbook/recipes/distillation/saving_benchmark_evaluator.py b/tinker_cookbook/recipes/distillation/saving_benchmark_evaluator.py
+new file mode 100644
+index 0000000..cc22072
+--- /dev/null
++++ b/tinker_cookbook/recipes/distillation/saving_benchmark_evaluator.py
+@@ -0,0 +1,142 @@
++"""Inline benchmark evaluator that keeps its generations and reports truncation.
++
++:class:`~tinker_cookbook.eval.benchmark_evaluator.BenchmarkEvaluator` reports a
++score and discards the generations, which leaves an eval result hard to audit:
++a wrong answer and an answer cut off at ``max_tokens`` are indistinguishable in
++the metrics. This subclass adds three things on top of it:
++
++* saves decoded transcripts and ``result.json`` under one directory per eval
++  step, so a finished run still contains what the model actually wrote;
++* draws ``num_samples`` per example, which turns the reported score into a mean
++  over that many draws and shrinks run-to-run noise on small benchmarks;
++* surfaces truncation counts and pass@k, which :class:`BenchmarkResult` carries
++  as top-level fields that the base evaluator drops.
++"""
++
++from __future__ import annotations
++
++import dataclasses
++import logging
++from pathlib import Path
++
++import tinker
++
++from tinker_cookbook.eval.benchmark_evaluator import BenchmarkEvaluator
++from tinker_cookbook.eval.benchmarks import load_result
++from tinker_cookbook.renderers import Renderer
++
++logger = logging.getLogger(__name__)
++
++
++class SavingBenchmarkEvaluator(BenchmarkEvaluator):
++    """A :class:`BenchmarkEvaluator` that persists generations under a per-step directory.
++
++    Args:
++        benchmark_name: Name of the benchmark in the registry (e.g. ``"aime_2024"``).
++        renderer: Renderer for tokenization and prompt building.
++        save_root: Directory to hold one ``step_XXXX/`` subdirectory per eval.
++        eval_every: The training loop's eval interval, used to label the
++            per-step directories.
++        first_eval_step: Training step of this evaluator's first call. Zero for
++            a fresh run; on a resumed run it must be the first multiple of
++            ``eval_every`` at or after the resumed start step, since that is
++            when the trainers' ``i_batch % eval_every == 0`` check next fires.
++        num_samples: Draws per example. Values above 1 make the reported
++            ``score`` a mean over that many draws (``pass@1`` in the pass@k
++            table is the same quantity), which is the cheap way to get a usable
++            signal out of a benchmark with few examples.
++        max_examples: Maximum examples to evaluate per call.
++        max_tokens: Maximum generation tokens per sample.
++        temperature: Sampling temperature.
++        timeout_seconds: Per-example wall-clock limit. Examples that exceed it
++            are scored as failures rather than truncations, so this must stay
++            comfortably above the time it takes to generate ``max_tokens``.
++    """
++
++    def __init__(
++        self,
++        benchmark_name: str,
++        renderer: Renderer,
++        *,
++        save_root: Path | str,
++        eval_every: int,
++        first_eval_step: int = 0,
++        num_samples: int = 1,
++        max_examples: int = 100,
++        max_tokens: int = 32768,
++        temperature: float = 0.6,
++        timeout_seconds: float = 1800,
++    ):
++        super().__init__(
++            benchmark_name,
++            renderer,
++            max_examples=max_examples,
++            max_tokens=max_tokens,
++            temperature=temperature,
++        )
++        assert num_samples >= 1, f"num_samples must be >= 1, got {num_samples}"
++        assert eval_every >= 1, f"eval_every must be >= 1, got {eval_every}"
++        assert first_eval_step >= 0 and first_eval_step % eval_every == 0, (
++            f"first_eval_step ({first_eval_step}) must be a non-negative multiple of "
++            f"eval_every ({eval_every}); the trainers only evaluate on steps where "
++            "i_batch % eval_every == 0"
++        )
++        self.config = dataclasses.replace(
++            self.config, num_samples=num_samples, timeout_seconds=timeout_seconds
++        )
++        self._save_root = Path(save_root)
++        self._eval_every = eval_every
++        self._first_eval_step = first_eval_step
++        self._num_evals = 0
++
++    async def __call__(self, sampling_client: tinker.SamplingClient) -> dict[str, float]:
++        """Run the benchmark, save its transcripts, and return metrics.
++
++        Returns the base evaluator's metrics plus ``num_truncated``,
++        ``frac_truncated``, and one ``pass@k`` entry per reported k.
++        """
++        # Both trainers build the evaluator once and call it at each eval step in
++        # order, so the call count plus first_eval_step recovers the step number.
++        # The directory assertion below is what keeps that inference honest.
++        step = self._first_eval_step + self._num_evals * self._eval_every
++        self._num_evals += 1
++        save_dir = self._save_root / f"step_{step:04d}"
++        benchmark_dir = save_dir / self.benchmark_name
++        assert not benchmark_dir.exists(), (
++            f"{benchmark_dir} already exists, so this evaluator's call count "
++            f"({self._num_evals}) plus first_eval_step ({self._first_eval_step}) no "
++            "longer identifies the training step. Benchmark runs append to "
++            "trajectories.jsonl, which would pool generations from two different "
++            "checkpoints into one file."
++        )
++        self.config = dataclasses.replace(self.config, save_dir=str(save_dir))
++
++        metrics = await super().__call__(sampling_client)
++
++        result = load_result(str(save_dir), self.benchmark_name)
++        assert result is not None, (
++            f"{self.benchmark_name} reported metrics but wrote no result.json under "
++            f"{save_dir}; the transcripts this run is supposed to keep are missing"
++        )
++        assert result.num_examples > 0, (
++            f"{self.benchmark_name} graded 0 examples at step {step}; "
++            f"max_examples={self.config.max_examples}"
++        )
++        prefix = f"eval/{self.benchmark_name}"
++        metrics[f"{prefix}/num_truncated"] = float(result.num_truncated)
++        metrics[f"{prefix}/frac_truncated"] = result.num_truncated / result.num_examples
++        for k, value in result.pass_at_k.items():
++            metrics[f"{prefix}/pass@{k}"] = float(value)
++
++        logger.info(
++            "%s step %d: score=%.3f over %d graded samples, %d truncated at %d tokens; "
++            "transcripts in %s",
++            self.benchmark_name,
++            step,
++            result.score,
++            result.num_examples,
++            result.num_truncated,
++            self.config.max_tokens,
++            benchmark_dir,
++        )
++        return metrics
+diff --git a/b/tinker_cookbook/recipes/distillation/saving_benchmark_evaluator_test.py b/tinker_cookbook/recipes/distillation/saving_benchmark_evaluator_test.py
+new file mode 100644
+index 0000000..0f5197a
+--- /dev/null
++++ b/tinker_cookbook/recipes/distillation/saving_benchmark_evaluator_test.py
+@@ -0,0 +1,182 @@
++"""Tests for the per-step bookkeeping in :class:`SavingBenchmarkEvaluator`.
++
++The evaluator infers the training step from its own call count, because the
++trainers hand it nothing but a sampling client. These tests pin that inference
++and the guard that fires when it stops holding.
++"""
++
++from pathlib import Path
++from typing import cast
++
++import pytest
++import tinker
++
++from tinker_cookbook.eval.benchmark_evaluator import BenchmarkEvaluator
++from tinker_cookbook.eval.benchmarks import BenchmarkResult
++from tinker_cookbook.recipes.distillation import saving_benchmark_evaluator
++from tinker_cookbook.recipes.distillation.saving_benchmark_evaluator import (
++    SavingBenchmarkEvaluator,
++)
++from tinker_cookbook.renderers import Renderer
++
++BENCHMARK = "aime_2024"
++
++
++def _make_result(*, num_truncated: int = 0, num_examples: int = 240) -> BenchmarkResult:
++    return BenchmarkResult(
++        name=BENCHMARK,
++        score=0.25,
++        num_examples=num_examples,
++        num_correct=60,
++        num_errors=0,
++        num_truncated=num_truncated,
++        pass_at_k={1: 0.25, 8: 0.6},
++    )
++
++
++@pytest.fixture
++def evaluator(tmp_path: Path) -> SavingBenchmarkEvaluator:
++    return SavingBenchmarkEvaluator(
++        BENCHMARK,
++        cast(Renderer, object()),
++        save_root=tmp_path,
++        eval_every=5,
++        num_samples=8,
++        max_examples=200,
++        max_tokens=16384,
++        temperature=1.0,
++    )
++
++
++@pytest.fixture
++def stub_benchmark(monkeypatch: pytest.MonkeyPatch) -> list[str | None]:
++    """Record the save_dir each run would have used, skipping the real benchmark."""
++    seen_save_dirs: list[str | None] = []
++
++    async def fake_call(self: BenchmarkEvaluator, _: tinker.SamplingClient) -> dict[str, float]:
++        seen_save_dirs.append(self.config.save_dir)
++        assert self.config.save_dir is not None
++        # The real runner creates this directory; later calls assert on its absence.
++        (Path(self.config.save_dir) / self.benchmark_name).mkdir(parents=True)
++        return {f"eval/{self.benchmark_name}/score": 0.25}
++
++    monkeypatch.setattr(BenchmarkEvaluator, "__call__", fake_call)
++    monkeypatch.setattr(
++        saving_benchmark_evaluator, "load_result", lambda *_args, **_kwargs: _make_result()
++    )
++    return seen_save_dirs
++
++
++def test_num_samples_reaches_the_benchmark_config(evaluator: SavingBenchmarkEvaluator) -> None:
++    assert evaluator.config.num_samples == 8
++
++
++def test_timeout_stays_above_the_runner_default(evaluator: SavingBenchmarkEvaluator) -> None:
++    # A 16k-token rollout can outlast BenchmarkConfig's 300s default, and a
++    # timed-out example is scored wrong rather than truncated.
++    assert evaluator.config.timeout_seconds >= 1800
++
++
++@pytest.mark.parametrize(("num_samples", "eval_every"), [(0, 5), (1, 0), (-1, 5)])
++def test_rejects_degenerate_settings(tmp_path: Path, num_samples: int, eval_every: int) -> None:
++    with pytest.raises(AssertionError):
++        SavingBenchmarkEvaluator(
++            BENCHMARK,
++            cast(Renderer, object()),
++            save_root=tmp_path,
++            eval_every=eval_every,
++            num_samples=num_samples,
++        )
++
++
++@pytest.mark.asyncio
++async def test_save_dir_tracks_the_training_step(
++    evaluator: SavingBenchmarkEvaluator, stub_benchmark: list[str | None], tmp_path: Path
++) -> None:
++    sampling_client = cast(tinker.SamplingClient, object())
++    for _ in range(3):
++        await evaluator(sampling_client)
++
++    assert stub_benchmark == [
++        str(tmp_path / "step_0000"),
++        str(tmp_path / "step_0005"),
++        str(tmp_path / "step_0010"),
++    ]
++
++
++@pytest.mark.asyncio
++async def test_resumed_run_labels_steps_from_first_eval_step(
++    stub_benchmark: list[str | None], tmp_path: Path
++) -> None:
++    # A run resumed at step 21 does not evaluate at 21: the trainers only eval
++    # where i_batch % eval_every == 0, so the next one lands at 25.
++    resumed = SavingBenchmarkEvaluator(
++        BENCHMARK,
++        cast(Renderer, object()),
++        save_root=tmp_path,
++        eval_every=5,
++        first_eval_step=25,
++        num_samples=8,
++    )
++    for _ in range(2):
++        await resumed(cast(tinker.SamplingClient, object()))
++
++    assert stub_benchmark == [str(tmp_path / "step_0025"), str(tmp_path / "step_0030")]
++
++
++def test_first_eval_step_must_align_with_eval_every(tmp_path: Path) -> None:
++    with pytest.raises(AssertionError, match="multiple of"):
++        SavingBenchmarkEvaluator(
++            BENCHMARK,
++            cast(Renderer, object()),
++            save_root=tmp_path,
++            eval_every=5,
++            first_eval_step=21,
++        )
++
++
++@pytest.mark.asyncio
++async def test_refuses_to_reuse_a_step_directory(
++    evaluator: SavingBenchmarkEvaluator, stub_benchmark: list[str | None], tmp_path: Path
++) -> None:
++    # Stand in for a resumed run, whose call count restarts at 0 while the real
++    # training step does not. Pooling two checkpoints' generations into one
++    # trajectories.jsonl must fail loudly instead.
++    (tmp_path / "step_0000" / BENCHMARK).mkdir(parents=True)
++
++    with pytest.raises(AssertionError, match="no longer identifies the training step"):
++        await evaluator(cast(tinker.SamplingClient, object()))
++    assert stub_benchmark == []
++
++
++@pytest.mark.asyncio
++async def test_reports_truncation_and_pass_at_k(
++    evaluator: SavingBenchmarkEvaluator,
++    stub_benchmark: list[str | None],
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    monkeypatch.setattr(
++        saving_benchmark_evaluator,
++        "load_result",
++        lambda *_args, **_kwargs: _make_result(num_truncated=24, num_examples=240),
++    )
++
++    metrics = await evaluator(cast(tinker.SamplingClient, object()))
++
++    prefix = f"eval/{BENCHMARK}"
++    assert metrics[f"{prefix}/num_truncated"] == 24.0
++    assert metrics[f"{prefix}/frac_truncated"] == pytest.approx(0.1)
++    assert metrics[f"{prefix}/pass@1"] == pytest.approx(0.25)
++    assert metrics[f"{prefix}/pass@8"] == pytest.approx(0.6)
++
++
++@pytest.mark.asyncio
++async def test_missing_result_file_is_an_error(
++    evaluator: SavingBenchmarkEvaluator,
++    stub_benchmark: list[str | None],
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    monkeypatch.setattr(saving_benchmark_evaluator, "load_result", lambda *_args, **_kwargs: None)
++
++    with pytest.raises(AssertionError, match=r"wrote no result\.json"):
++        await evaluator(cast(tinker.SamplingClient, object()))
+diff --git a/tinker_cookbook/rl/rollout_logging.py b/tinker_cookbook/rl/rollout_logging.py
+index 8cfd0e3..e7b073b 100644
+--- a/tinker_cookbook/rl/rollout_logging.py
++++ b/tinker_cookbook/rl/rollout_logging.py
+@@ -1,16 +1,21 @@
+-"""Utilities for exporting per-rollout records to JSONL."""
++"""Utilities for exporting per-rollout records to JSONL and HTML."""
+ 
+ import json
+ import logging
+-from collections.abc import Sequence
++from collections.abc import Iterator, Sequence
++from contextlib import contextmanager
+ from dataclasses import dataclass
+ from pathlib import Path
+-from typing import Any
++from typing import TYPE_CHECKING, Any
+ 
+ from tinker_cookbook.rl.types import TrajectoryGroup
++from tinker_cookbook.utils import logtree
+ from tinker_cookbook.utils.deprecation import deprecated
+ from tinker_cookbook.utils.misc_utils import safezip
+ 
++if TYPE_CHECKING:
++    from tinker_cookbook.stores.training_store import TrainingRunStore
++
+ logger = logging.getLogger(__name__)
+ 
+ 
+@@ -250,3 +255,55 @@ def write_rollout_summaries_jsonl_from_groups(
+         taglist_P=[group.tags for group in groups_P],
+         sampling_client_steps_P=[group.sampling_client_step for group in groups_P],
+     )
++
++
++_LOGTREE_EXPLANATION = (
++    "This HTML log was generated by logtree during training. "
++    "It shows rollouts and rewards for a subset of trajectory groups in this iteration. "
++    "To customize what gets logged, modify the logtree calls in your Env implementation "
++    "(see examples in tinker_cookbook/recipes/)."
++)
++
++
++@contextmanager
++def logtree_scope(
++    output_dir: Path | None,
++    num_groups_to_log: int,
++    f_name: str,
++    scope_name: str,
++    iteration: int,
++    store: "TrainingRunStore | None",
++) -> Iterator[None]:
++    """Context manager that logs rollout data to HTML and JSON via logtree.
++
++    Creates ``output_dir/f_name.html`` (direct I/O — visualization artifact)
++    and writes the logtree JSON via ``store.write_logtree()`` when store is available.
++
++    Rollouts only appear in the output if they were produced with logging
++    enabled (see ``enable_logging`` on the rollout helpers); this scope is what
++    gives those logtree calls somewhere to land.
++
++    Args:
++        output_dir (Path | None): Iteration directory for the HTML file.
++            ``None`` disables logging entirely.
++        num_groups_to_log (int): Number of groups the caller intends to log.
++            Values ``<= 0`` disable logging entirely.
++        f_name (str): Base filename, without extension.
++        scope_name (str): Human-readable name for the root logtree scope.
++        iteration (int): Training iteration / batch index.
++        store (TrainingRunStore | None): Store used to write the logtree JSON.
++    """
++    if output_dir is None or num_groups_to_log <= 0:
++        yield
++        return
++
++    output_dir.mkdir(parents=True, exist_ok=True)
++    logtree_path = str(output_dir / f"{f_name}.html")
++    logtree_trace = None
++    try:
++        with logtree.init_trace(scope_name, path=logtree_path) as logtree_trace:
++            logtree.log_text(_LOGTREE_EXPLANATION)
++            yield
++    finally:
++        if logtree_trace is not None and store is not None:
++            store.write_logtree(iteration, logtree_trace.to_dict(), base_name=f_name)
+diff --git a/tinker_cookbook/rl/train.py b/tinker_cookbook/rl/train.py
+index e6c6c6d..678287e 100644
+--- a/tinker_cookbook/rl/train.py
++++ b/tinker_cookbook/rl/train.py
+@@ -9,9 +9,8 @@ import io
+ import logging
+ import re
+ import time
+-from collections.abc import Callable, Coroutine, Iterable, Iterator, Sequence
++from collections.abc import Callable, Coroutine, Iterable, Sequence
+ from concurrent.futures import Executor
+-from contextlib import contextmanager
+ from dataclasses import dataclass
+ from pathlib import Path
+ from typing import TYPE_CHECKING, Any, TypeVar
+@@ -46,6 +45,7 @@ from tinker_cookbook.rl.rollout_limits import TerminationRewardPolicy
+ from tinker_cookbook.rl.rollout_logging import (
+     RolloutSummaryExportConfig,
+     RolloutSummaryGroup,
++    logtree_scope,
+ )
+ from tinker_cookbook.rl.rollout_presets import (
+     default_rollout_config_for_model,
+@@ -70,7 +70,7 @@ from tinker_cookbook.rl.types import (
+     TrajectoryGroup,
+ )
+ from tinker_cookbook.tokenizer_utils import Tokenizer, get_tokenizer
+-from tinker_cookbook.utils import logtree, ml_log, trace
++from tinker_cookbook.utils import ml_log, trace
+ from tinker_cookbook.utils.git_rev import recipe_user_metadata
+ from tinker_cookbook.utils.misc_utils import iteration_dir, safezip, split_list
+ 
+@@ -162,44 +162,6 @@ def _maybe_export_rollout_summary_jsonl(
+     store.write_rollouts(iteration, records, base_name=base_name)
+ 
+ 
+-_LOGTREE_EXPLANATION = (
+-    "This HTML log was generated by logtree during RL training. "
+-    "It shows rollouts and rewards for a subset of trajectory groups in this iteration. "
+-    "To customize what gets logged, modify the logtree calls in your Env implementation "
+-    "(see examples in tinker_cookbook/recipes/)."
+-)
+-
+-
+-@contextmanager
+-def _get_logtree_scope(
+-    output_dir: Path | None,
+-    num_groups_to_log: int,
+-    f_name: str,
+-    scope_name: str,
+-    iteration: int,
+-    store: TrainingRunStore | None,
+-) -> Iterator[None]:
+-    """Context manager that logs rollout data to HTML and JSON via logtree.
+-
+-    Creates ``output_dir/f_name.html`` (direct I/O — visualization artifact)
+-    and writes the logtree JSON via ``store.write_logtree()`` when store is available.
+-    """
+-    if output_dir is None or num_groups_to_log <= 0:
+-        yield
+-        return
+-
+-    output_dir.mkdir(parents=True, exist_ok=True)
+-    logtree_path = str(output_dir / f"{f_name}.html")
+-    logtree_trace = None
+-    try:
+-        with logtree.init_trace(scope_name, path=logtree_path) as logtree_trace:
+-            logtree.log_text(_LOGTREE_EXPLANATION)
+-            yield
+-    finally:
+-        if logtree_trace is not None and store is not None:
+-            store.write_logtree(iteration, logtree_trace.to_dict(), base_name=f_name)
+-
+-
+ def _select_representative_inds(scores: list[float], num_inds: int) -> list[int]:
+     assert num_inds <= len(scores)
+     sorted_inds = np.argsort(scores)
+@@ -600,7 +562,7 @@ async def run_single_evaluation(
+     ev_name = _get_evaluator_name(evaluator)
+     eval_base_name = f"eval_{evaluator_label}"
+     iter_dir = iteration_dir(config.log_path, i_batch)
+-    with _get_logtree_scope(
++    with logtree_scope(
+         output_dir=iter_dir,
+         num_groups_to_log=config.num_groups_to_log,
+         f_name=eval_base_name,
+@@ -746,7 +708,7 @@ async def do_sync_training_with_stream_minibatch(
+                     metrics.update(eval_metrics)
+ 
+             iter_dir = iteration_dir(config.log_path, i_batch)
+-            with _get_logtree_scope(
++            with logtree_scope(
+                 iter_dir,
+                 config.num_groups_to_log,
+                 "train",
+@@ -1755,7 +1717,7 @@ async def do_sync_training(
+             # Initialize logtree trace for this iteration if logging is enabled
+             iter_dir = iteration_dir(config.log_path, i_batch)
+             async with trace.scope_span("sampling"):
+-                with _get_logtree_scope(
++                with logtree_scope(
+                     output_dir=iter_dir,
+                     num_groups_to_log=config.num_groups_to_log,
+                     f_name="train",
