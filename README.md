@@ -27,7 +27,10 @@ on-policy distillation on this student: the reasoning command in the
 [distillation tutorial](https://tinker-docs.thinkingmachines.ai/cookbook/recipes/distillation/),
 plus the defaults of `on_policy_distillation.py` for any setting the command
 leaves unset. ✓ means our setting matches it, and ✗ means it differs. The
-tutorial has no GRPO arm, so the comparison is with our OPD run.
+tutorial covers only on-policy distillation and has no GRPO recipe, so the ✓/✗
+marks compare it with our OPD run. Our GRPO run uses the same settings as our
+OPD run in every row except the training signal and the teacher, so the same
+marks apply to it.
 
 | | GRPO | OPD | Official tutorial (OPD) |
 |---|---|---|---|
