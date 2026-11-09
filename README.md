@@ -22,19 +22,28 @@ This checkpoint is the default `load_checkpoint_path` in
 `opd_vs_grpo.py`, and both training logs report loading it at step 0. Before
 any update, both arms score the same AIME'24 mean@8 of 0.500 (120 of 240).
 
-| | GRPO | OPD |
-|---|---|---|
-| Student / init | Qwen3.5-9B-Base + rank-128 SFT checkpoint above | same |
-| Training signal | `MathEnv` correctness reward (+0.1 format term), group-centered advantages | zero environment reward; advantage = −(log p_student − log p_teacher) per token (reverse KL, `kl_penalty_coef=1.0`, `kl_discount_factor=0`) |
-| Teacher | none | `Qwen/Qwen3.5-9B` |
-| Data | DeepMath-103K, shuffled with seed 0 | same dataset, same order, same prompt text (`opd_dataset=matched`) |
-| Batch | 64 prompts × 4 rollouts | same |
-| Learning rate | 1e-4, constant, Adam (β₁=0.9, β₂=0.95) | same |
-| Rollout cap / temperature | 16 384 tokens / 1.0 | same |
-| Loss | `importance_sampling` | same |
-| Steps | 40 | same |
-| Eval | AIME'24, 30 problems × 8 samples (mean@8), 16 384 tokens, temperature 1.0, every 5 steps | same |
+The last column shows Thinking Machines' official recipe for reproducing
+on-policy distillation on this student: the reasoning command in the
+[distillation tutorial](https://tinker-docs.thinkingmachines.ai/cookbook/recipes/distillation/),
+plus the defaults of `on_policy_distillation.py` for any setting the command
+leaves unset. ✓ means our setting matches it, and ✗ means it differs. The
+tutorial has no GRPO arm, so the comparison is with our OPD run.
 
+| | GRPO | OPD | Official tutorial (OPD) |
+|---|---|---|---|
+| Student / init | Qwen3.5-9B-Base + rank-128 SFT checkpoint above | same | same checkpoint ✓ |
+| LoRA rank | 128 (inherited from the checkpoint) | same | 128 ✓ |
+| Training signal | `MathEnv` correctness reward (+0.1 format term), group-centered advantages | zero environment reward; advantage = −(log p_student − log p_teacher) per token (reverse KL, `kl_penalty_coef=1.0`, `kl_discount_factor=0`) | reverse KL, `kl_penalty_coef=1.0`, `kl_discount_factor=0` ✓ |
+| Teacher | none | `Qwen/Qwen3.5-9B` | `Qwen/Qwen3.5-9B` ✓ |
+| Data | DeepMath-103K, shuffled with seed 0 | same dataset, same order, same prompt text (`opd_dataset=matched`) | DeepMath-103K ✓; bare question, prompt cut at 1 024 tokens, unshuffled ✗ (see below) |
+| Batch | 64 prompts × 4 rollouts | same | 512 prompts × 4 rollouts ✗ |
+| Learning rate | 1e-4, constant, Adam (β₁=0.9, β₂=0.95) | same | 1e-4 ✓ |
+| Rollout cap / temperature | 16 384 tokens / 1.0 | same | 16 384 / 1.0 ✓ |
+| Loss | `importance_sampling` | same | `importance_sampling` ✓ |
+| Steps | 40 | same | 200 ✗ |
+| Eval | AIME'24, 30 problems × 8 samples (mean@8), 16 384 tokens, temperature 1.0, every 5 steps | same | AIME'24, 64 000 tokens, temperature 1.0, top-p 1.0, top-k off; temperature, top-p, top-k ✓, token cap ✗ |
+
+All three differences in the tutorial column apply to both of our arms equally.
 The exact resolved configs are in `runs/grpo/config.json` and
 `runs/opd_matched/config.json`.
 
@@ -66,20 +75,29 @@ These numbers are from `runs/*/metrics.jsonl`, at step 40.
 
 ## Hyperparameter choices
 
-Only some of the settings come from Thinking Machines' [distillation
-tutorial](https://tinker-docs.thinkingmachines.ai/cookbook/recipes/distillation/)
-and the cookbook defaults:
+The table above compares every setting with the official tutorial. In summary:
 
-- **From the tutorial or defaults:** the SFT checkpoint, the teacher, the
-  learning rate (1e-4, the tutorial's LoRA rate), the 16 384-token rollout cap,
-  group size 4, temperature 1.0, `kl_penalty_coef=1.0`, and
-  `kl_discount_factor=0`.
-- **Our choice:** the batch size and the step count. The tutorial uses 512
-  prompts per batch for 200 steps (the script default is 1024). We used **64
-  prompts per batch for 40 steps.**
+- **Taken from the tutorial or the script defaults:** the SFT checkpoint and
+  its LoRA rank, the teacher, the training data (DeepMath-103K), the learning
+  rate (1e-4, the tutorial's LoRA rate), the 16 384-token rollout cap, group
+  size 4, temperature 1.0, the `importance_sampling` loss,
+  `kl_penalty_coef=1.0`, and `kl_discount_factor=0`.
+- **Our choice: batch size and step count.** The tutorial uses 512 prompts per
+  batch for 200 steps (the script default is 1024). We used **64 prompts per
+  batch for 40 steps.**
+- **Our choice: prompt format.** The tutorial's OPD command uses
+  `PromptOnlyDatasetBuilder`. It gives the bare DeepMath question, cuts the
+  prompt at 1 024 tokens, and keeps the dataset order. Our GRPO arm needs a
+  gradable answer, so it uses `MathEnv` prompts: the same question plus the
+  instruction "Write your answer in \boxed{} format.", in shuffled order. We
+  gave OPD the same prompts (`opd_dataset=matched`) so that the two arms see
+  the same questions in the same order, and the training signal is the only
+  difference. The launcher still supports the tutorial's format with
+  `opd_dataset=prompt_only`, but we did not run it.
+- **Our choice: evaluation cap.** See "Evaluation cap" below.
 
-We made this choice because we had limited compute credit. We do not expect it
-to change the conclusion, for two reasons:
+We chose the batch size and step count because we had limited compute credit.
+We do not expect them to change the conclusion, for two reasons:
 
 1. **Batch size.** The budget-controlled batch-size ablation in the paper
    (Appendix D.3, Figure 11) covers 64, 128, and 256 prompts at a fixed total
